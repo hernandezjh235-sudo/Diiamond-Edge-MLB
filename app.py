@@ -2,7 +2,7 @@ import math
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -40,6 +40,8 @@ PITCHER_FS = {"out":1,"k":3,"er":-3,"hit":-1,"bb":-1,"hbp":-1,"win":6}
 PROP_TYPES = ["Pitcher Strikeouts","Pitcher Fantasy","Batter Fantasy","Hits","Home Runs","Runs","RBI","Hits + Runs + RBIs"]
 TEAM_ABBR = {"Arizona Diamondbacks":"ARI","Atlanta Braves":"ATL","Baltimore Orioles":"BAL","Boston Red Sox":"BOS","Chicago Cubs":"CHC","Chicago White Sox":"CWS","Cincinnati Reds":"CIN","Cleveland Guardians":"CLE","Colorado Rockies":"COL","Detroit Tigers":"DET","Houston Astros":"HOU","Kansas City Royals":"KC","Los Angeles Angels":"LAA","Los Angeles Dodgers":"LAD","Miami Marlins":"MIA","Milwaukee Brewers":"MIL","Minnesota Twins":"MIN","New York Mets":"NYM","New York Yankees":"NYY","Athletics":"ATH","Oakland Athletics":"ATH","Philadelphia Phillies":"PHI","Pittsburgh Pirates":"PIT","San Diego Padres":"SD","Seattle Mariners":"SEA","San Francisco Giants":"SF","St. Louis Cardinals":"STL","Tampa Bay Rays":"TB","Texas Rangers":"TEX","Toronto Blue Jays":"TOR","Washington Nationals":"WSH"}
 OPENING_DAY_DEFAULT = "2026-03-26"
+FINAL_STATES = {"Final", "Game Over", "Completed Early"}
+REV_TEAM_ABBR = {v:k for k,v in TEAM_ABBR.items()}
 
 DEMO_LINES = pd.DataFrame([
     {"player":"Dylan Cease","team":"TOR","opponent":"BOS","prop_type":"Pitcher Strikeouts","side":"Higher","line":6.5,"source":"Demo"},
@@ -117,6 +119,125 @@ def load_learning_logs(kind: str) -> pd.DataFrame:
     if "date" in df: df["date"]=pd.to_datetime(df["date"], errors="coerce")
     return df
 
+@st.cache_data(ttl=60*10, show_spinner=False)
+def load_team_offense() -> pd.DataFrame:
+    p=DATA_DIR/"team_offense_metrics.csv"
+    return pd.read_csv(p) if p.exists() else pd.DataFrame()
+
+@st.cache_data(ttl=60*10, show_spinner=False)
+def load_bullpen() -> pd.DataFrame:
+    p=DATA_DIR/"bullpen_metrics.csv"
+    return pd.read_csv(p) if p.exists() else pd.DataFrame()
+
+def dedupe_save(df: pd.DataFrame, path: Path, keys: List[str]) -> None:
+    if df.empty:
+        return
+    for k in keys:
+        if k not in df.columns:
+            df[k] = None
+    df = df.drop_duplicates(subset=keys, keep="last")
+    df.to_csv(path, index=False)
+
+def _safe_int(x, default=0):
+    try:
+        if x in (None, "", "-"):
+            return default
+        return int(float(x))
+    except Exception:
+        return default
+
+def _team_abbr_from_box(team_obj: dict) -> str:
+    name = team_obj.get("name") or team_obj.get("teamName") or team_obj.get("clubName") or ""
+    return TEAM_ABBR.get(name, name[:3].upper())
+
+def build_logs_from_gamepk(game_pk: int, game_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Pull one official MLB boxscore and return batter/pitcher log rows. MLB-only."""
+    data = get_json(f"{MLB_BASE}/game/{game_pk}/feed/live")
+    box = data.get("liveData", {}).get("boxscore", {}).get("teams", {})
+    game = data.get("gameData", {})
+    away_team = _team_abbr_from_box(game.get("teams", {}).get("away", {}))
+    home_team = _team_abbr_from_box(game.get("teams", {}).get("home", {}))
+    season = _safe_int(game.get("game", {}).get("season") or str(game_date)[:4], datetime.now().year)
+    batter_rows, pitcher_rows = [], []
+    for side in ["away", "home"]:
+        team = away_team if side == "away" else home_team
+        opp = home_team if side == "away" else away_team
+        is_home = side == "home"
+        players = box.get(side, {}).get("players", {})
+        for _, item in players.items():
+            person = item.get("person", {})
+            pid = person.get("id")
+            name = person.get("fullName") or person.get("boxscoreName")
+            stats = item.get("stats", {}) or {}
+            batting = stats.get("batting", {}) or {}
+            pitching = stats.get("pitching", {}) or {}
+            # Batters: require plate appearance or AB/H/R/BB stats.
+            if batting and any(str(batting.get(k, "0")) not in ("0", "", "-") for k in ["plateAppearances", "atBats", "hits", "runs", "baseOnBalls"]):
+                h = _safe_int(batting.get("hits")); d = _safe_int(batting.get("doubles")); t = _safe_int(batting.get("triples")); hr = _safe_int(batting.get("homeRuns")); sng = max(h-d-t-hr, 0)
+                r = _safe_int(batting.get("runs")); rbi = _safe_int(batting.get("rbi")); bb = _safe_int(batting.get("baseOnBalls")); sb = _safe_int(batting.get("stolenBases")); k = _safe_int(batting.get("strikeOuts")); tb = sng + 2*d + 3*t + 4*hr
+                batter_rows.append({
+                    "player_id": pid, "player": name, "date": game_date, "team": team, "opponent": opp, "home": is_home,
+                    "pa": _safe_int(batting.get("plateAppearances")), "ab": _safe_int(batting.get("atBats")), "h": h,
+                    "single": sng, "double": d, "triple": t, "hr": hr, "r": r, "rbi": rbi, "bb": bb, "sb": sb, "k": k,
+                    "tb": tb, "hrr": h+r+rbi, "batter_fs": sng*3+d*5+t*8+hr*10+r*2+rbi*2+bb*2+sb*5,
+                    "gamePk": game_pk, "lineup_slot": item.get("battingOrder"), "season": season, "source": "mlb_patch"
+                })
+            # Pitchers: require innings pitched or batters faced.
+            if pitching and (str(pitching.get("inningsPitched", "0")) not in ("0", "0.0", "", "-") or _safe_int(pitching.get("battersFaced")) > 0):
+                ip = pitching.get("inningsPitched", "0"); outs = ip_to_outs(ip); kk = _safe_int(pitching.get("strikeOuts")); er = _safe_int(pitching.get("earnedRuns")); ha = _safe_int(pitching.get("hits")); bbp = _safe_int(pitching.get("baseOnBalls")); hbp = _safe_int(pitching.get("hitBatsmen")); runs = _safe_int(pitching.get("runs")); hra = _safe_int(pitching.get("homeRuns"))
+                pitcher_rows.append({
+                    "player_id": pid, "player": name, "date": game_date, "team": team, "opponent": opp, "home": is_home,
+                    "k": kk, "ip": ip_to_float(ip), "outs": outs, "bf": _safe_int(pitching.get("battersFaced")), "pitch_count": _safe_int(pitching.get("pitchesThrown")),
+                    "er": er, "hits_allowed": ha, "runs_allowed": runs, "hr_allowed": hra, "bb_allowed": bbp,
+                    "whip": round((ha+bbp)/max(ip_to_float(ip), .1), 3), "pitcher_fs": outs+kk*3-er*3-ha-bbp-hbp,
+                    "gamePk": game_pk, "season": season, "source": "mlb_patch"
+                })
+    return pd.DataFrame(batter_rows), pd.DataFrame(pitcher_rows)
+
+def patch_missing_logs(end_day: date, start_day: Optional[date] = None) -> Dict[str, object]:
+    """Patch missing official MLB logs from local max date through selected date."""
+    b_path, p_path = DATA_DIR/"batter_game_logs.csv", DATA_DIR/"pitcher_game_logs.csv"
+    b_old = pd.read_csv(b_path) if b_path.exists() else pd.DataFrame()
+    p_old = pd.read_csv(p_path) if p_path.exists() else pd.DataFrame()
+    for old in [b_old, p_old]:
+        if not old.empty and "date" in old:
+            old["date"] = pd.to_datetime(old["date"], errors="coerce")
+    last_dates = []
+    for old in [b_old, p_old]:
+        if not old.empty and old["date"].notna().any():
+            last_dates.append(old["date"].max().date())
+    if start_day is None:
+        start_day = (min(last_dates) + timedelta(days=1)) if last_dates else datetime.strptime(OPENING_DAY_DEFAULT, "%Y-%m-%d").date()
+    if start_day > end_day:
+        return {"patched_dates": [], "games": 0, "batters_added": 0, "pitchers_added": 0, "message": "Logs already current."}
+    all_b, all_p, patched, games_seen = [], [], [], 0
+    day = start_day
+    while day <= end_day:
+        sched = get_schedule(day.isoformat())
+        day_b, day_p = [], []
+        for g in sched:
+            if str(g.get("status", "")) not in FINAL_STATES:
+                continue
+            try:
+                b, p = build_logs_from_gamepk(int(g["gamePk"]), day.isoformat())
+                if not b.empty: day_b.append(b)
+                if not p.empty: day_p.append(p)
+                games_seen += 1
+            except Exception:
+                continue
+        if day_b or day_p:
+            patched.append(day.isoformat())
+            all_b.extend(day_b); all_p.extend(day_p)
+        day += timedelta(days=1)
+    b_new = pd.concat([b_old] + all_b, ignore_index=True) if all_b else b_old
+    p_new = pd.concat([p_old] + all_p, ignore_index=True) if all_p else p_old
+    if not b_new.empty:
+        dedupe_save(b_new, b_path, ["gamePk", "player", "date", "team"])
+    if not p_new.empty:
+        dedupe_save(p_new, p_path, ["gamePk", "player", "date", "team"])
+    load_learning_logs.clear()
+    return {"patched_dates": patched, "games": games_seen, "batters_added": int(sum(len(x) for x in all_b)), "pitchers_added": int(sum(len(x) for x in all_p)), "message": "Patch complete."}
+
 def local_player_match(name: str, group: str) -> Optional[dict]:
     """Fallback when MLB player search/API is unavailable. Uses bundled learning logs."""
     local=load_learning_logs(group)
@@ -169,18 +290,74 @@ def grade_from_prob(prob):
     if prob>=0.48: return "C","yellow"
     return "Fade","red"
 
-def simple_projection(df: pd.DataFrame, col: str, opponent: str, is_home: bool) -> float:
-    if df.empty or col not in df: return 0.0
-    vals=df[col].astype(float); parts=[]
-    parts.append((vals.tail(5).mean(), .35)); parts.append((vals.tail(10).mean(), .25))
-    h=df[df["home"]==is_home][col].tail(10).astype(float).mean() if "home" in df else np.nan
-    h2h=df[df["opponent"]==opponent][col].tail(10).astype(float).mean() if opponent and "opponent" in df else np.nan
-    if not np.isnan(h): parts.append((h,.15))
-    if not np.isnan(h2h): parts.append((h2h,.18))
-    # slight recent volatility tax
-    sd=vals.tail(10).std() if len(vals)>=3 else 0
-    den=sum(w for _,w in parts); proj=sum(v*w for v,w in parts)/den
-    return round(float(proj),2)
+def opponent_rank_factor(prop_type: str, opponent: str) -> float:
+    """Small MLB-only matchup nudge based on bundled logs and team offense tables."""
+    if not opponent:
+        return 0.0
+    # Pitcher K/Fantasy props: higher opposing K allowed from pitcher logs is good for overs.
+    try:
+        ranks = opponent_weakness(prop_type, datetime.now().year, min_games=10)
+        if not ranks.empty and opponent in ranks["opponent"].astype(str).values:
+            r = int(ranks.loc[ranks["opponent"].astype(str)==opponent, "rank"].iloc[0])
+            n = max(len(ranks), 1)
+            return round((n + 1 - r) / n - 0.5, 3)  # -0.5 to +0.5
+    except Exception:
+        pass
+    return 0.0
+
+def simple_projection(df: pd.DataFrame, col: str, opponent: str, is_home: bool, prop_type: str = "") -> float:
+    """Weighted projection engine: L5/L10, home-away, H2H, pitch volume, matchup, bullpen/team context."""
+    if df.empty or col not in df:
+        return 0.0
+    vals = pd.to_numeric(df[col], errors="coerce").dropna()
+    if vals.empty:
+        return 0.0
+    parts = []
+    parts.append((vals.tail(5).mean(), .34))
+    parts.append((vals.tail(10).mean(), .24))
+    h = pd.to_numeric(df[df.get("home", False)==is_home][col], errors="coerce").tail(12).mean() if "home" in df else np.nan
+    h2h = pd.to_numeric(df[df.get("opponent", "").astype(str).str.upper()==str(opponent).upper()][col], errors="coerce").tail(10).mean() if opponent and "opponent" in df else np.nan
+    if not np.isnan(h): parts.append((h, .13))
+    if not np.isnan(h2h): parts.append((h2h, .17))
+    den = sum(w for _, w in parts)
+    proj = sum(v*w for v, w in parts) / max(den, .01)
+    # Pitcher volume hooks: pitch count, BF and IP trend matter for K and FS.
+    if "Pitcher" in str(prop_type):
+        if "pitch_count" in df:
+            pc = pd.to_numeric(df["pitch_count"], errors="coerce").tail(5).mean()
+            if not np.isnan(pc):
+                proj += (pc - 82) / 55.0
+        if "bf" in df:
+            bf = pd.to_numeric(df["bf"], errors="coerce").tail(5).mean()
+            if not np.isnan(bf):
+                proj += (bf - 20) / 18.0
+        if "ip" in df:
+            ip = pd.to_numeric(df["ip"], errors="coerce").tail(5).mean()
+            if not np.isnan(ip) and ip < 4.5:
+                proj -= (4.5 - ip) * 0.35
+        proj += opponent_rank_factor(prop_type or "Pitcher Strikeouts", opponent) * 0.45
+    else:
+        # Batter props: opposing bullpen weakness helps late-game fantasy/RBI/run paths.
+        bp = load_bullpen()
+        if not bp.empty and opponent in bp.get("team", pd.Series(dtype=str)).astype(str).values:
+            row = bp[bp["team"].astype(str)==opponent].iloc[0]
+            era = pd.to_numeric(pd.Series([row.get("bp_era_14d", row.get("season_bullpen_era", 4.2))]), errors="coerce").iloc[0]
+            if not np.isnan(era):
+                proj += (era - 4.2) * 0.18
+        off = load_team_offense()
+        # Team offense context: if player team offense is strong, run/RBI opportunities improve. Uses recent team if present.
+        try:
+            team = str(df["team"].dropna().astype(str).tail(1).iloc[0])
+            if not off.empty and team in off.get("team", pd.Series(dtype=str)).astype(str).values:
+                oscore = float(off[off["team"].astype(str)==team]["season_offense_score"].iloc[0])
+                proj += (oscore - 100) / 100.0
+        except Exception:
+            pass
+    # Volatility clamp: do not let one spike game over-dominate.
+    sd = vals.tail(10).std() if len(vals) >= 3 else 0
+    if sd and sd > vals.tail(10).mean() * 0.85:
+        proj -= 0.10 * sd
+    return round(float(max(proj, 0)), 2)
 
 # ---------- Underdog best effort ----------
 def map_ud_stat(stat: str) -> str:
@@ -280,11 +457,14 @@ def optimize_slip(lines: pd.DataFrame, season:int, top_n=8):
         if df.empty: continue
         col,label=value_col_for_prop(row["prop_type"]); line=float(row["line"]); side=row.get("side","Higher")
         h10,n10,a10=calc_hit_rate(df,col,line,side,10); h5,n5,a5=calc_hit_rate(df,col,line,side,5)
-        proj=simple_projection(df,col,row.get("opponent",""), True)
+        proj=simple_projection(df,col,row.get("opponent",""), True, row.get("prop_type",""))
         prob=(0.55*(h10/n10 if n10 else 0)+0.45*(h5/n5 if n5 else 0))
         edge=(proj-line) if side=="Higher" else (line-proj)
-        score=prob*70 + max(min(edge,3),-3)*5
-        rows.append({"player":row["player"],"prop_type":row["prop_type"],"side":side,"line":line,"projection":proj,"L5":f"{h5}/{n5}","L10":f"{h10}/{n10}","prob_score":round(prob*100,1),"edge":round(edge,2),"optimizer_score":round(score,1)})
+        recent_vals = pd.to_numeric(df[col], errors="coerce").tail(10)
+        volatility = float(recent_vals.std()) if len(recent_vals) > 2 else 0.0
+        matchup = opponent_rank_factor(row["prop_type"], row.get("opponent", ""))
+        score=prob*70 + max(min(edge,3),-3)*6 + matchup*8 - min(volatility, 5)*1.2
+        rows.append({"player":row["player"],"prop_type":row["prop_type"],"side":side,"line":line,"projection":proj,"L5":f"{h5}/{n5}","L10":f"{h10}/{n10}","prob_score":round(prob*100,1),"edge":round(edge,2),"volatility":round(volatility,2),"matchup_adj":round(matchup,2),"optimizer_score":round(score,1)})
     return pd.DataFrame(rows).sort_values("optimizer_score",ascending=False).head(top_n) if rows else pd.DataFrame()
 
 # ---------- charts/cards ----------
@@ -302,7 +482,7 @@ def line_chart(df, col, line, label, side="Higher"):
 def player_card(row, df, is_home=True):
     prop_type=row["prop_type"]; col,label=value_col_for_prop(prop_type); line=float(row["line"]); side=row.get("side","Higher")
     h5,n5,a5=calc_hit_rate(df,col,line,side,5); h10,n10,a10=calc_hit_rate(df,col,line,side,10)
-    opp=row.get("opponent",""); proj=simple_projection(df,col,opp,is_home); prob=(h10/n10) if n10 else 0; grade,color=grade_from_prob(prob)
+    opp=row.get("opponent",""); proj=simple_projection(df,col,opp,is_home,prop_type); prob=(h10/n10) if n10 else 0; grade,color=grade_from_prob(prob)
     initials="".join([x[:1] for x in str(row["player"]).split()[:2]]).upper()
     st.markdown(f"""
 <div class='prop-card'><div class='player-row'><div class='avatar'>{initials}</div><div><p class='player-name'>{row['player']}</p><div class='player-meta'>{row.get('team','')} vs {opp} • {prop_type}</div></div><div class='line-pill'><div class='dir'>{'↑' if side=='Higher' else '↓'} {line}</div><div class='stat'>{label}</div></div></div>
@@ -326,6 +506,13 @@ with st.sidebar:
         else:
             st.session_state.active_lines=df_ud; st.success(f"Loaded {len(df_ud)} lines and saved line history")
     if st.button("Use Manual Lines", use_container_width=True): st.session_state.active_lines=st.session_state.manual_lines.copy()
+    if st.button("Patch Missing MLB Logs", use_container_width=True):
+        with st.spinner("Patching official MLB batter and pitcher logs..."):
+            try:
+                result = patch_missing_logs(selected_date)
+                st.success(f"{result['message']} Games: {result['games']} • Batter rows: +{result['batters_added']} • Pitcher rows: +{result['pitchers_added']}")
+            except Exception as e:
+                st.error(f"Patch failed: {e}")
     uploaded=st.file_uploader("Upload manual lines CSV", type=["csv"])
     if uploaded:
         st.session_state.manual_lines=pd.read_csv(uploaded); st.session_state.active_lines=st.session_state.manual_lines.copy()
@@ -381,7 +568,13 @@ with tabs[0]:
                 else: st.dataframe(h2h.sort_values("date",ascending=False),use_container_width=True)
             lm=line_movement(row["player"], row["prop_type"])
             if not lm.empty:
-                st.markdown("**Line Movement History**"); st.dataframe(lm.tail(10),use_container_width=True)
+                st.markdown("**Line Movement History**")
+                try:
+                    lm2=lm.copy(); lm2["timestamp"]=pd.to_datetime(lm2["timestamp"], errors="coerce"); lm2=lm2.sort_values("timestamp")
+                    open_line=float(lm2["line"].iloc[0]); cur_line=float(lm2["line"].iloc[-1])
+                    st.caption(f"Opened {open_line} → Current {cur_line} • Move {round(cur_line-open_line,2)}")
+                except Exception: pass
+                st.dataframe(lm.tail(10),use_container_width=True)
             st.markdown("**Recent logs**"); st.dataframe(df.tail(15).sort_values("date",ascending=False),use_container_width=True)
 
 with tabs[1]:
