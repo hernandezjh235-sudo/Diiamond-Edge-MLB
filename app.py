@@ -26,7 +26,7 @@ try:
 except Exception:
     go = None
 
-APP_VERSION = "RESEARCH_V4_MASTER_BUILD_2026_06_17_PURPLE_NO_PROJECTIONS"
+APP_VERSION = "RESEARCH_V4_1_FIX_KEYS_CLEAN_UD_NAMES_2026_06_17"
 
 UNDERDOG_URLS = [
     "https://api.underdogfantasy.com/beta/v6/over_under_lines",
@@ -286,11 +286,40 @@ def map_stat_to_prop(stat: Any) -> Optional[str]:
     return None
 
 def is_mlb_like_text(*vals: Any) -> bool:
+    """Hard filter wrong-sport / esports contamination from Underdog's combined feed."""
     t = " ".join(str(v or "") for v in vals).lower()
-    bad = ["nba","wnba","nfl","nhl","soccer","tennis","golf","ncaab","football","basketball","college"]
+    bad = [
+        "nba","wnba","nfl","nhl","soccer","tennis","golf","ncaab","football","basketball","college",
+        "cod:", "call of duty", "counter-strike", "counter strike", "cs2", "valorant", "league of legends",
+        "dota", "esports", "e-sports", "maps 1-", "map 1", "map 2", "games 1-", "game 1-",
+        "kills", "assists on maps", "fantasy points on games"
+    ]
     if any(b in t for b in bad):
         return False
     return True
+
+def clean_underdog_player_name(player: Any, prop: Optional[str]=None) -> str:
+    """Remove Underdog market suffixes so names match batter/pitcher logs."""
+    s = str(player or "").strip()
+    if not s:
+        return s
+    # Reject obvious non-player market labels before cleaning.
+    low = s.lower()
+    if any(x in low for x in ["cod:", "fantasy points on games", "games 1-", "maps 1-", "call of duty"]):
+        return ""
+    patterns = [
+        r"\s+strikeouts?\s+o/u.*$", r"\s+pitcher\s+strikeouts?\s+o/u.*$",
+        r"\s+home\s+runs?\s+o/u.*$", r"\s+home\s+runs?.*$",
+        r"\s+fantasy\s+(points|score)\s+o/u.*$", r"\s+fantasy\s+(points|score).*$",
+        r"\s+hits?\s*\+\s*runs?\s*\+\s*rbis?\s+o/u.*$",
+        r"\s+h\s*\+\s*r\s*\+\s*rbi\s+o/u.*$",
+        r"\s+hits?\s+runs?\s+rbis?.*$", r"\s+o/u.*$", r"\s+over/under.*$",
+    ]
+    for pat in patterns:
+        s = re.sub(pat, "", s, flags=re.I).strip()
+    # Remove trailing market leftovers.
+    s = re.sub(r"\s+(strikeouts?|home runs?|fantasy points?|fantasy score|h\+r\+rbi)$", "", s, flags=re.I).strip()
+    return s
 
 def flatten_json(obj: Any) -> List[Dict[str,Any]]:
     rows = []
@@ -381,9 +410,13 @@ def fetch_underdog_lines() -> Tuple[pd.DataFrame, str]:
                 prop = map_stat_to_prop(" ".join(str(x or "") for x in [stat, game, attrs.get("display_title"), attrs.get("description")]))
             if prop is None:
                 continue
+            player = clean_underdog_player_name(player, prop)
             if not player or normalize_name(player) in {"unknown", "over", "under", "higher", "lower"}:
                 continue
             if not is_mlb_like_text(stat, player, team, game, attrs):
+                continue
+            # Require a plausible baseball player name after cleaning. This removes COD/team-market junk.
+            if len(normalize_name(player).split()) < 2:
                 continue
             # crude date
             start_time = first(attrs, ["scheduled_at", "start_time", "game_time", "match_start_time", "starts_at"])
@@ -563,7 +596,8 @@ def render_player_card(line_row: pd.Series, logs: pd.DataFrame, prop_type: str):
 </div>
 """, unsafe_allow_html=True)
 
-    view = st.radio("Research view", ["L5","L10","L20","Season","H2H","Home","Away","Final"], horizontal=True, key=f"view_{player_key}_{prop_type}_{line}", label_visibility="collapsed")
+    card_uid = normalize_name(f"{player_key}_{prop_type}_{line}_{team}_{game}_{getattr(line_row, 'name', '')}_{line_row.get('raw_stat','')}")
+    view = st.radio("Research view", ["L5","L10","L20","Season","H2H","Home","Away","Final"], horizontal=True, key=f"view_{card_uid}", label_visibility="collapsed")
     if view != "Final":
         filtered = filter_logs(logs, player_key, stat_col, view, opponent)
         snap = research_snapshot(filtered, stat_col, line)
@@ -630,7 +664,7 @@ update_line_history(lines)
 
 st.markdown(f"""
 <div class="hero">
-  <div class="hero-title">Diamond Edge MLB Research</div><div class="build-chip">RESEARCH_V4_MASTER_BUILD_2026_06_17_PURPLE_NO_PROJECTIONS</div>
+  <div class="hero-title">Diamond Edge MLB Research</div><div class="build-chip">RESEARCH_V4_1_FIX_KEYS_CLEAN_UD_NAMES_2026_06_17</div>
   <div class="hero-sub">MLB-only • Underdog lines • Outlier-style player cards • Research grades only</div>
   <div class="top-actions"><span class="pill">{APP_VERSION}</span><span class="pill">{line_msg}</span></div>
 </div>
