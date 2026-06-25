@@ -1,0 +1,305 @@
+# -*- coding: utf-8 -*-
+"""
+Standalone MLB Pitcher Game Log Puller
+- Pulls official MLB StatsAPI pitching game logs for a date range
+- Builds projection-useful Pitch.csv rows
+- Can merge with an existing Pitch.csv
+Run: streamlit run standalone_mlb_pitcher_log_puller_app.py
+"""
+
+import io
+import time
+from datetime import date, datetime, timedelta
+
+import pandas as pd
+import requests
+import streamlit as st
+
+MLB_BASE = "https://statsapi.mlb.com/api/v1"
+
+st.set_page_config(page_title="MLB Pitcher Log Puller", layout="wide")
+
+st.title("📊 MLB Pitcher Game Log Puller")
+st.caption("Pull missing pitcher logs directly from MLB StatsAPI, then download or merge with your existing Pitch.csv.")
+
+
+def safe_float(x, default=None):
+    try:
+        if x is None or x == "":
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def baseball_ip_to_float(ip):
+    if ip is None:
+        return None
+    try:
+        s = str(ip)
+        if "." not in s:
+            return float(s)
+        whole, frac = s.split(".", 1)
+        outs = int(frac[:1]) if frac else 0
+        if outs not in [0, 1, 2]:
+            return float(s)
+        return int(whole) + outs / 3.0
+    except Exception:
+        return None
+
+
+def date_range(start: date, end: date):
+    d = start
+    while d <= end:
+        yield d.strftime("%Y-%m-%d")
+        d += timedelta(days=1)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_json(url, params=None):
+    r = requests.get(
+        url,
+        params=params or {},
+        timeout=20,
+        headers={
+            "User-Agent": "Mozilla/5.0 MLBPitcherLogPuller/1.0",
+            "Accept": "application/json,text/plain,*/*",
+        },
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_schedule(day_str):
+    return get_json(
+        f"{MLB_BASE}/schedule",
+        params={"sportId": 1, "date": day_str, "hydrate": "team,probablePitcher"},
+    )
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_boxscore(game_pk):
+    return get_json(f"{MLB_BASE}/game/{game_pk}/boxscore")
+
+
+def player_side_from_box(box, pitcher_id):
+    for side in ["away", "home"]:
+        players = (box.get("teams", {}).get(side, {}) or {}).get("players", {}) or {}
+        for key, pdata in players.items():
+            person = pdata.get("person", {}) or {}
+            if str(person.get("id")) == str(pitcher_id):
+                return side, pdata
+    return None, None
+
+
+def extract_pitchers_from_game(day_str, game):
+    game_pk = game.get("gamePk")
+    teams = game.get("teams", {}) or {}
+    away_team = teams.get("away", {}).get("team", {}) or {}
+    home_team = teams.get("home", {}).get("team", {}) or {}
+    away_abbr = away_team.get("abbreviation") or away_team.get("teamName") or away_team.get("name")
+    home_abbr = home_team.get("abbreviation") or home_team.get("teamName") or home_team.get("name")
+    matchup = f"{away_abbr} @ {home_abbr}"
+    rows = []
+
+    try:
+        box = get_boxscore(game_pk)
+    except Exception as e:
+        return [], f"Boxscore failed game {game_pk}: {e}"
+
+    for side in ["away", "home"]:
+        team_obj = away_team if side == "away" else home_team
+        opp_obj = home_team if side == "away" else away_team
+        team_abbr = team_obj.get("abbreviation") or team_obj.get("teamName") or team_obj.get("name")
+        opp_abbr = opp_obj.get("abbreviation") or opp_obj.get("teamName") or opp_obj.get("name")
+        players = (box.get("teams", {}).get(side, {}) or {}).get("players", {}) or {}
+
+        for _, pdata in players.items():
+            stats = (pdata.get("stats", {}) or {}).get("pitching", {}) or {}
+            if not stats:
+                continue
+            ip_raw = stats.get("inningsPitched")
+            ip_float = baseball_ip_to_float(ip_raw)
+            # Skip non-appearing pitchers
+            if ip_float is None or ip_float <= 0:
+                continue
+
+            person = pdata.get("person", {}) or {}
+            player_id = person.get("id")
+            name = person.get("fullName") or pdata.get("fullName") or ""
+
+            so = safe_float(stats.get("strikeOuts"), 0) or 0
+            bb = safe_float(stats.get("baseOnBalls"), 0) or 0
+            h = safe_float(stats.get("hits"), 0) or 0
+            r = safe_float(stats.get("runs"), 0) or 0
+            er = safe_float(stats.get("earnedRuns"), 0) or 0
+            hr = safe_float(stats.get("homeRuns"), 0) or 0
+            hbp = safe_float(stats.get("hitBatsmen"), 0) or 0
+            pitches = safe_float(stats.get("pitchesThrown"), None)
+            strikes = safe_float(stats.get("strikes"), None)
+            bf = safe_float(stats.get("battersFaced"), None)
+            outs = safe_float(stats.get("outs"), None)
+
+            k_pct = (so / bf) if bf and bf > 0 else None
+            bb_pct = (bb / bf) if bf and bf > 0 else None
+            kbb_pct = (k_pct - bb_pct) if k_pct is not None and bb_pct is not None else None
+            whip = ((bb + h) / ip_float) if ip_float and ip_float > 0 else None
+            k9 = (so * 9 / ip_float) if ip_float and ip_float > 0 else None
+            bb9 = (bb * 9 / ip_float) if ip_float and ip_float > 0 else None
+            hr9 = (hr * 9 / ip_float) if ip_float and ip_float > 0 else None
+            strike_pct = (strikes / pitches) if pitches and pitches > 0 and strikes is not None else None
+            pitches_per_bf = (pitches / bf) if pitches and bf and bf > 0 else None
+            pitches_per_ip = (pitches / ip_float) if pitches and ip_float and ip_float > 0 else None
+
+            rows.append({
+                "Date": day_str,
+                "GamePk": game_pk,
+                "Matchup": matchup,
+                "PitcherID": player_id,
+                "Pitcher": name,
+                "Team": team_abbr,
+                "Opponent": opp_abbr,
+                "HomeAway": "Away" if side == "away" else "Home",
+                "IP": ip_raw,
+                "IP_float": round(ip_float, 3) if ip_float is not None else None,
+                "Outs": outs,
+                "BF": bf,
+                "Pitch Count": pitches,
+                "Strikes": strikes,
+                "Strike%": round(strike_pct, 4) if strike_pct is not None else None,
+                "Pitches/BF": round(pitches_per_bf, 3) if pitches_per_bf is not None else None,
+                "Pitches/IP": round(pitches_per_ip, 3) if pitches_per_ip is not None else None,
+                "H": h,
+                "R": r,
+                "ER": er,
+                "HR": hr,
+                "BB": bb,
+                "HBP": hbp,
+                "K": so,
+                "K%": round(k_pct, 4) if k_pct is not None else None,
+                "BB%": round(bb_pct, 4) if bb_pct is not None else None,
+                "K-BB%": round(kbb_pct, 4) if kbb_pct is not None else None,
+                "WHIP": round(whip, 3) if whip is not None else None,
+                "K9": round(k9, 3) if k9 is not None else None,
+                "BB9": round(bb9, 3) if bb9 is not None else None,
+                "HR9": round(hr9, 3) if hr9 is not None else None,
+                "Source": "MLB StatsAPI boxscore",
+            })
+    return rows, None
+
+
+def pull_logs(start: date, end: date, sleep_s=0.05):
+    rows = []
+    errors = []
+    days = list(date_range(start, end))
+    prog = st.progress(0)
+    status = st.empty()
+
+    for i, day_str in enumerate(days, start=1):
+        status.write(f"Pulling {day_str}... ({i}/{len(days)})")
+        try:
+            sched = get_schedule(day_str)
+            games = []
+            for d in sched.get("dates", []) or []:
+                games.extend(d.get("games", []) or [])
+            for g in games:
+                state = ((g.get("status") or {}).get("abstractGameState") or "").lower()
+                if state not in ["final", "live", "preview"]:
+                    pass
+                game_rows, err = extract_pitchers_from_game(day_str, g)
+                rows.extend(game_rows)
+                if err:
+                    errors.append(err)
+                time.sleep(sleep_s)
+        except Exception as e:
+            errors.append(f"{day_str}: {e}")
+        prog.progress(i / max(len(days), 1))
+
+    status.write(f"Done. Rows: {len(rows)}. Errors: {len(errors)}")
+    return pd.DataFrame(rows), errors
+
+
+def normalize_for_dedupe(df):
+    out = df.copy()
+    for c in ["Date", "Pitcher", "Team", "Opponent", "GamePk"]:
+        if c not in out.columns:
+            out[c] = ""
+    out["_dedupe_key"] = (
+        out["Date"].astype(str) + "|" +
+        out["Pitcher"].astype(str).str.lower().str.strip() + "|" +
+        out["Team"].astype(str).str.lower().str.strip() + "|" +
+        out["Opponent"].astype(str).str.lower().str.strip() + "|" +
+        out["GamePk"].astype(str)
+    )
+    return out
+
+
+with st.sidebar:
+    st.header("Pull Settings")
+    start = st.date_input("Start date", value=date(2026, 6, 12))
+    end = st.date_input("End date", value=date(2026, 6, 26))
+    uploaded = st.file_uploader("Optional: upload your existing Pitch.csv to merge", type=["csv"])
+    st.warning("For your missing data, use 2026-06-12 to 2026-06-26.")
+
+if "pulled_df" not in st.session_state:
+    st.session_state["pulled_df"] = pd.DataFrame()
+if "errors" not in st.session_state:
+    st.session_state["errors"] = []
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    if st.button("🚀 Pull Pitcher Logs", type="primary", use_container_width=True):
+        if start > end:
+            st.error("Start date cannot be after end date.")
+        else:
+            df, errors = pull_logs(start, end)
+            st.session_state["pulled_df"] = df
+            st.session_state["errors"] = errors
+with c2:
+    if st.button("🧹 Clear Pulled Data", use_container_width=True):
+        st.session_state["pulled_df"] = pd.DataFrame()
+        st.session_state["errors"] = []
+with c3:
+    st.metric("Pulled Rows", len(st.session_state["pulled_df"]))
+
+pulled_df = st.session_state["pulled_df"]
+
+if not pulled_df.empty:
+    st.subheader("Pulled Pitcher Logs")
+    st.dataframe(pulled_df, use_container_width=True, height=450)
+    csv_bytes = pulled_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download Missing Logs CSV",
+        data=csv_bytes,
+        file_name=f"Pitch_MISSING_ONLY_{start}_to_{end}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    if uploaded is not None:
+        try:
+            existing = pd.read_csv(uploaded)
+            existing2 = normalize_for_dedupe(existing)
+            pulled2 = normalize_for_dedupe(pulled_df)
+            merged = pd.concat([existing2, pulled2], ignore_index=True)
+            merged = merged.drop_duplicates("_dedupe_key", keep="last").drop(columns=["_dedupe_key"], errors="ignore")
+            st.subheader("Merged Pitch.csv")
+            st.success(f"Existing rows: {len(existing)} | Added rows: {len(pulled_df)} | Merged rows: {len(merged)}")
+            st.dataframe(merged.tail(100), use_container_width=True, height=350)
+            st.download_button(
+                "⬇️ Download MERGED Pitch CSV",
+                data=merged.to_csv(index=False).encode("utf-8"),
+                file_name=f"Pitch_EXTENDED_{start}_to_{end}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.error(f"Could not merge uploaded CSV: {e}")
+
+if st.session_state["errors"]:
+    with st.expander("Errors / skipped games"):
+        for e in st.session_state["errors"][:200]:
+            st.write(e)
+
+st.info("This pulls official MLB StatsAPI boxscore pitching logs. It does not touch your main app or saved grading files.")
